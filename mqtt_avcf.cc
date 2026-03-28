@@ -222,4 +222,194 @@ public:
         return 0;
     }
 
-    // Task 4 will add call_end() here and close the class.
+    /* -- call_end --------------------------------------------------------- */
+
+    int call_end(Call_Data_t call_info) override {
+        if (!write_enabled_ && !mqtt_enabled_) return 0;
+        if (call_info.filename.empty()) return 0;
+
+        // Filter: skip digital calls if analog_only is set
+        if (analog_only_ && !call_info.audio_type.empty() && call_info.audio_type != "analog")
+            return 0;
+
+        // Read the audio file
+        std::ifstream audio_file(call_info.filename, std::ios::binary | std::ios::ate);
+        if (!audio_file.is_open()) {
+            BOOST_LOG_TRIVIAL(error) << TAG << "Cannot open " << call_info.filename;
+            return 0;
+        }
+        size_t audio_size = audio_file.tellg();
+        audio_file.seekg(0);
+        std::vector<uint8_t> audio_bytes(audio_size);
+        audio_file.read(reinterpret_cast<char *>(audio_bytes.data()), audio_size);
+        audio_file.close();
+
+        std::string content_type = detect_content_type(call_info.filename);
+        uint32_t call_id = next_id_++;
+
+        // Build .avcf in memory
+        std::vector<uint8_t> avcf;
+        avcf.reserve(audio_size + 1024); // audio + overhead for headers/metadata
+
+        // 1. CALL_START
+        {
+            std::string sys = call_info.short_name;
+            uint8_t nlen = static_cast<uint8_t>(std::min(sys.size(), (size_t)255));
+            sssp_header_t hdr; fill_header(hdr, SSSP_MSG_CALL_START, sizeof(sssp_call_start_t) + nlen);
+            append(avcf, &hdr, sizeof(hdr));
+            sssp_call_start_t cs{};
+            cs.talkgroup = (uint32_t)call_info.talkgroup;
+            cs.frequency_hz = (uint64_t)call_info.freq;
+            cs.timestamp_us = (uint64_t)call_info.start_time * 1000000ULL;
+            cs.call_id = call_id;
+            cs.system_name_len = nlen;
+            append(avcf, &cs, sizeof(cs));
+            if (nlen) append(avcf, sys.data(), nlen);
+        }
+
+        // 2. AUDIO_DATA
+        {
+            uint8_t ct_len = static_cast<uint8_t>(std::min(content_type.size(), (size_t)255));
+            uint32_t payload_len = 1 + ct_len + static_cast<uint32_t>(audio_size);
+            sssp_header_t hdr; fill_header(hdr, SSSP_MSG_AUDIO_DATA, payload_len);
+            append(avcf, &hdr, sizeof(hdr));
+            append(avcf, &ct_len, 1);
+            append(avcf, content_type.data(), ct_len);
+            append(avcf, audio_bytes.data(), audio_size);
+        }
+
+        // 3. CALL_METADATA (JSON)
+        {
+            nlohmann::ordered_json meta;
+            if (!call_info.talkgroup_tag.empty())        meta["tg_tag"] = call_info.talkgroup_tag;
+            if (!call_info.talkgroup_alpha_tag.empty())   meta["tg_alpha_tag"] = call_info.talkgroup_alpha_tag;
+            if (!call_info.talkgroup_group.empty())       meta["tg_group"] = call_info.talkgroup_group;
+            if (!call_info.talkgroup_description.empty()) meta["tg_description"] = call_info.talkgroup_description;
+            meta["signal"] = call_info.signal;
+            meta["noise"] = call_info.noise;
+            meta["freq_error"] = call_info.freq_error;
+            meta["spike_count"] = call_info.spike_count;
+            meta["emergency"] = call_info.emergency;
+            meta["priority"] = call_info.priority;
+            meta["phase2_tdma"] = call_info.phase2_tdma;
+            meta["tdma_slot"] = call_info.tdma_slot;
+            if (!call_info.patched_talkgroups.empty()) {
+                nlohmann::ordered_json ptgs = nlohmann::ordered_json::array();
+                for (const auto tg : call_info.patched_talkgroups) ptgs.push_back(tg);
+                meta["patched_tgs"] = ptgs;
+            }
+            if (!call_info.transmission_source_list.empty()) {
+                nlohmann::ordered_json src_list = nlohmann::ordered_json::array();
+                for (const auto &src : call_info.transmission_source_list) {
+                    src_list.push_back({
+                        {"src", src.source}, {"time", src.time}, {"pos", src.position},
+                        {"emergency", src.emergency}, {"signal_system", src.signal_system},
+                        {"tag", src.tag}
+                    });
+                }
+                meta["src_list"] = src_list;
+            }
+            std::string json_str = meta.dump();
+            uint32_t json_len = static_cast<uint32_t>(json_str.size());
+            sssp_header_t hdr; fill_header(hdr, SSSP_MSG_CALL_METADATA, json_len);
+            append(avcf, &hdr, sizeof(hdr));
+            append(avcf, json_str.data(), json_len);
+        }
+
+        // 4. CALL_END
+        {
+            std::string sys = call_info.short_name;
+            uint8_t nlen = static_cast<uint8_t>(std::min(sys.size(), (size_t)255));
+            sssp_header_t hdr; fill_header(hdr, SSSP_MSG_CALL_END, sizeof(sssp_call_end_t) + nlen);
+            append(avcf, &hdr, sizeof(hdr));
+            sssp_call_end_t ce{};
+            ce.talkgroup = (uint32_t)call_info.talkgroup;
+            ce.call_id = call_id;
+            ce.src_id = (uint32_t)call_info.source_num;
+            ce.frequency_hz = (uint64_t)call_info.freq;
+            ce.duration_ms = (uint32_t)(call_info.length * 1000.0);
+            ce.error_count = (uint32_t)call_info.error_count;
+            ce.encrypted = call_info.encrypted ? 1 : 0;
+            ce.system_name_len = nlen;
+            append(avcf, &ce, sizeof(ce));
+            if (nlen) append(avcf, sys.data(), nlen);
+        }
+
+        // Write .avcf sidecar file
+        if (write_enabled_) {
+            std::string avcf_path = wav_to_avcf(call_info.filename);
+            std::ofstream out(avcf_path, std::ios::binary | std::ios::trunc);
+            if (out.is_open()) {
+                out.write(reinterpret_cast<const char *>(avcf.data()), avcf.size());
+                if (out.good()) {
+                    BOOST_LOG_TRIVIAL(info) << TAG << "Wrote " << avcf_path
+                        << " (" << avcf.size() << " bytes)";
+                } else {
+                    BOOST_LOG_TRIVIAL(error) << TAG << "Write failed: " << avcf_path;
+                }
+                out.close();
+            } else {
+                BOOST_LOG_TRIVIAL(error) << TAG << "Cannot create " << avcf_path;
+            }
+        }
+
+        // Publish over MQTT
+        if (mqtt_enabled_ && mqtt_connected_) {
+            std::string b64 = bytes_to_base64(avcf);
+
+            nlohmann::ordered_json src_list = nlohmann::ordered_json::array();
+            for (const auto &src : call_info.transmission_source_list) {
+                src_list.push_back({
+                    {"src", src.source}, {"time", src.time}, {"pos", src.position},
+                    {"emergency", src.emergency}, {"signal_system", src.signal_system},
+                    {"tag", src.tag}
+                });
+            }
+
+            nlohmann::ordered_json payload = {
+                {"audio_avcf_base64", b64},
+                {"metadata", {
+                    {"talkgroup", call_info.talkgroup}, {"talkgroup_tag", call_info.talkgroup_tag},
+                    {"talkgroup_alpha_tag", call_info.talkgroup_alpha_tag},
+                    {"talkgroup_group", call_info.talkgroup_group},
+                    {"freq", call_info.freq}, {"start_time", call_info.start_time},
+                    {"stop_time", call_info.stop_time},
+                    {"call_length", call_info.stop_time - call_info.start_time},
+                    {"signal", call_info.signal}, {"noise", call_info.noise},
+                    {"freq_error", call_info.freq_error}, {"spike_count", call_info.spike_count},
+                    {"emergency", call_info.emergency}, {"priority", call_info.priority},
+                    {"phase2_tdma", call_info.phase2_tdma}, {"tdma_slot", call_info.tdma_slot},
+                    {"analog", true}, {"audio_type", call_info.audio_type},
+                    {"short_name", call_info.short_name},
+                    {"filename", basename_of(call_info.filename)},
+                    {"srcList", src_list}
+                }}
+            };
+
+            if (!call_info.patched_talkgroups.empty()) {
+                nlohmann::ordered_json ptgs = nlohmann::ordered_json::array();
+                for (const auto tg : call_info.patched_talkgroups) ptgs.push_back(tg);
+                payload["metadata"]["patched_talkgroups"] = ptgs;
+            }
+
+            std::string pub_topic = topic_ + "/avcf";
+            try {
+                mqtt_client_->publish(mqtt::message_ptr_builder()
+                    .topic(pub_topic).payload(payload.dump())
+                    .qos(qos_).retained(false).finalize());
+                BOOST_LOG_TRIVIAL(info) << TAG << "Published TG " << call_info.talkgroup
+                    << " (" << b64.size() << " b64 bytes) -> " << pub_topic;
+            } catch (const mqtt::exception &e) {
+                BOOST_LOG_TRIVIAL(error) << TAG << "Publish failed: " << e.what();
+            }
+        }
+
+        return 0;
+    }
+
+    static boost::shared_ptr<Avcf_Handler> create() {
+        return boost::shared_ptr<Avcf_Handler>(new Avcf_Handler());
+    }
+};
+
+BOOST_DLL_ALIAS(Avcf_Handler::create, create_plugin)
